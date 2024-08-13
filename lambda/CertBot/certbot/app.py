@@ -39,6 +39,8 @@ def handler(event, context):
         if (os.environ['DOMAINS_LIST'] != '') and (os.environ['DOMAINS_EMAIL'] != ''):
             os.system(f"rm -rf {CERTBOT_DIR}")
             os.system(f"mkdir {CERTBOT_DIR}")
+            write_authenticator_script()
+            write_cleanup_script()
             return request_certs(os.environ['DOMAINS_LIST'], os.environ['DOMAINS_EMAIL'])
         else:
             return return_502("Invalid Domain list or Domain Email")
@@ -60,6 +62,7 @@ def request_certs(domains, email):
 
         # Obtain a cert but don't install it
         'certonly',
+        '--manual',
 
         # Run in non-interactive mode
         '--non-interactive',
@@ -70,11 +73,12 @@ def request_certs(domains, email):
         # Email of domain administrators
         '--email', email,
 
-        # Use dns challenge with dns plugin
-        '--dns-route53',
-        # '--dns-route53-propagation-seconds', '720',
-        '--preferred-challenges', 'dns-01',
+        '--preferred-challenges', 'http',
         '--issuance-timeout', '900',
+
+        # Use the custom script for the HTTP challenge
+        '--manual-auth-hook', 'python3 /tmp/authenticator.py',
+        '--manual-cleanup-hook', 'python3 /tmp/cleanup.py',
 
         # Use this server instead of default acme-v01
         # '--server', CERTBOT_SERVER,
@@ -90,43 +94,7 @@ def request_certs(domains, email):
         cert_code = certbot.main.main(certbot_args)
     except certbot.errors.AuthorizationError as e:
         logger.error(e)
-        if str(e) == "Some challenges have failed.":
-            certbot_args_again = [
-                '--config-dir', CERTBOT_DIR + "/config",
-                '--work-dir', CERTBOT_DIR + "/work",
-                '--logs-dir', CERTBOT_DIR + "/logs",
-
-                '--cert-name', "ssl",
-
-                # Obtain a cert but don't install it
-                'certonly',
-
-                # Run in non-interactive mode
-                '--non-interactive',
-
-                # Agree to the terms of service
-                '--agree-tos',
-
-                # Email of domain administrators
-                '--email', email,
-
-                # Use dns challenge with dns plugin
-                '--dns-route53',
-                # '--dns-route53-propagation-seconds', '720',
-                '--preferred-challenges', 'dns-01',
-                '--issuance-timeout', '900',
-
-                # Use this server instead of default acme-v01
-                # '--server', CERTBOT_SERVER,
-
-                # Domains to provision certs for (comma separated)
-                '--domains', domains
-
-                # '--dry-run'
-            ]
-            cert_code = certbot.main.main(certbot_args_again)
-        else:
-            raise e
+        raise e
 
     logger.info(f"CertBot request exec code: {cert_code}")
 
@@ -428,3 +396,44 @@ def delete_previous_iam_certificate(previous_iam_certificate_name_list, replace_
             logger.error("Delete_IAM_Cert_Error:" + traceback.format_exc())
             replace_msg["Delete_Previous_IAM_SSL_Cert"][last_iam_ssl_name] = traceback.format_exc()
     return replace_msg
+
+def write_authenticator_script():
+    auth_script = """
+import os
+import boto3
+
+s3_client = boto3.client('s3')
+
+def authenticate(domain, token, cert):
+    bucket_name = "polaroid-landing-page"
+    key = f'.well-known/acme-challenge/{token}'
+    s3_client.put_object(Bucket=bucket_name, Key=key, Body=cert, ContentType='text/plain')
+
+if __name__ == "__main__":
+    domain = os.environ["CERTBOT_DOMAIN"]
+    token = os.environ["CERTBOT_TOKEN"]
+    cert = os.environ["CERTBOT_VALIDATION"]
+    authenticate(domain, token, cert)
+    """
+    with open("/tmp/authenticator.py", "w") as f:
+        f.write(auth_script)
+
+def write_cleanup_script():
+    cleanup_script = """
+import os
+import boto3
+
+s3_client = boto3.client('s3')
+
+def cleanup(domain, token):
+    bucket_name = "polaroid-landing-page"
+    key = f'.well-known/acme-challenge/{token}'
+    s3_client.delete_object(Bucket=bucket_name, Key=key)
+
+if __name__ == "__main__":
+    domain = os.environ["CERTBOT_DOMAIN"]
+    token = os.environ["CERTBOT_TOKEN"]
+    cleanup(domain, token)
+    """
+    with open("/tmp/cleanup.py", "w") as f:
+        f.write(cleanup_script)        
